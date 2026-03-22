@@ -50,14 +50,11 @@ create_launch_script() {
     local CONTENTSDIR=$1
     local EXECUTABLE_NAME=$2
     local COMMAND=$3
-
     cat << ENDOFSCRIPT > "$CONTENTSDIR/MacOS/$EXECUTABLE_NAME"
 #!/usr/bin/env bash
-
-export PATH=$PATH:/usr/local/bin/IMSProg_editor
-bash -c "$COMMAND > /dev/null 2>&1 &"
+export PATH="\$PATH:/usr/local/bin"
+exec $COMMAND "\$@"
 ENDOFSCRIPT
-
     chmod u+x "$CONTENTSDIR/MacOS/$EXECUTABLE_NAME"
 }
 
@@ -68,7 +65,7 @@ move_app() {
 
 create_imsprog_app() {
     create_directories "$CONTENTSDIR1"
-    generate_iconset "img/logo_IMSProg.svg" "$CONTENTSDIR1/Resources/IMSProg.icns"
+    generate_iconset "img/logo_icon.svg" "$CONTENTSDIR1/Resources/IMSProg.icns"
     update_plist "$CONTENTSDIR1" "IMSProg.icns" "IMSProg"
     create_launch_script "$CONTENTSDIR1" "IMSProg" "/usr/local/bin/IMSProg"
     move_app "IMSProg.app"

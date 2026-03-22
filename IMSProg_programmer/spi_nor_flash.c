@@ -22,6 +22,7 @@
 #include <unistd.h>
 #include <stdbool.h>
 #include "spi_controller.h"
+#include "ch554t.h"
 #include "snorcmd_api.h"
 #include "types.h"
 #include "timer.h"
@@ -98,6 +99,29 @@ struct chip_info {
 unsigned char algType = 0;
 //struct chip_info *spi_chip_info;
 
+#define PROGTYPE_CH554T 4
+#define CH554T_ERASE_MAX_POLLS 4096
+#define CH554T_ERASE_MIN_FALLBACK_POLLS 16
+#define CH554T_ERASE_MIN_LEARNED_POLLS 1
+#define CH554T_ERASE_INIT_POLLS_PER_BYTE (1.0 / 16384.0) /* 512 polls for 8MiB */
+#define CH554T_POLL_PROFILE_MAX 16
+static inline bool snor_is_ch554t(uint8_t progType)
+{
+    return progType == PROGTYPE_CH554T;
+}
+
+static int ch554t_erase_active = 0;
+static int ch554t_erase_estimated_polls = CH554T_ERASE_MAX_POLLS;
+static int ch554t_erase_poll_count = 0;
+static int ch554t_erase_last_pass_polls = 0;
+static uint32_t ch554t_cached_jedec_id = 0;
+struct ch554t_poll_profile {
+    uint32_t jedec_id;
+    int estimated_polls;
+};
+static struct ch554t_poll_profile ch554t_poll_profiles[CH554T_POLL_PROFILE_MAX] = {{0, 0}};
+static int ch554t_poll_profile_next_slot = 0;
+
 static int snor_read_sr(u8 *val);
 static int snor_write_sr(u8 *val);
 static int s95_read_sr(u8 *val);
@@ -105,7 +129,213 @@ static int s95_write_sr(u8 *val);
 int s95_wait_ready(int sleep_ms);
 int s95_unprotect(void);
 
-extern unsigned int bsize;
+static unsigned int ch554t_cached_chip_size_bytes = 0;
+
+static unsigned int ch554t_decode_size_from_jedec_capacity(uint8_t cap)
+{
+    /*
+     * JEDEC capacity code for SPI NOR typically maps to:
+     * size(bytes) = 2^cap
+     * e.g. 0x17 -> 2^23 = 8 MiB.
+     */
+    if ((cap >= 0x10) && (cap <= 0x1f)) return 1u << cap;
+    return 0;
+}
+
+static unsigned int ch554t_chip_size_bytes(unsigned int block_size)
+{
+    unsigned int chip_size = ch554t_cached_chip_size_bytes;
+    uint8_t id[3] = {0xff, 0xff, 0xff};
+    uint32_t jedec_id = 0;
+
+    if (chip_size > 0) return chip_size;
+
+    if (ch554t_read_devid(id, 3) == 0) {
+        jedec_id = ((uint32_t)id[0] << 16) | ((uint32_t)id[1] << 8) | (uint32_t)id[2];
+        if ((jedec_id != 0x000000u) && (jedec_id != 0xFFFFFFu)) ch554t_cached_jedec_id = jedec_id;
+        chip_size = ch554t_decode_size_from_jedec_capacity(id[2]);
+    }
+
+    /*
+     * Fallback when capacity code is unknown: assume a moderate NOR size
+     * so progress pacing still works and erase completion is enforced later.
+     */
+    if ((chip_size == 0) && (block_size > 0) && (block_size <= (0xFFFFFFFFu / 64u)))
+        chip_size = block_size * 64u;
+
+    ch554t_cached_chip_size_bytes = chip_size;
+
+    return chip_size;
+}
+
+static int ch554t_poll_profile_find(uint32_t jedec_id)
+{
+    int i;
+    if (jedec_id == 0) return -1;
+    for (i = 0; i < CH554T_POLL_PROFILE_MAX; i++) {
+        if (ch554t_poll_profiles[i].jedec_id == jedec_id) return i;
+    }
+    return -1;
+}
+
+static int ch554t_poll_profile_get(uint32_t jedec_id)
+{
+    int idx = ch554t_poll_profile_find(jedec_id);
+    if (idx < 0) return 0;
+    return ch554t_poll_profiles[idx].estimated_polls;
+}
+
+static void ch554t_poll_profile_set(uint32_t jedec_id, int measured_polls)
+{
+    int idx;
+
+    if (jedec_id == 0 || measured_polls <= 0) return;
+    idx = ch554t_poll_profile_find(jedec_id);
+    if (idx >= 0) {
+        int old_est = ch554t_poll_profiles[idx].estimated_polls;
+        if (old_est <= 0) ch554t_poll_profiles[idx].estimated_polls = measured_polls;
+        else ch554t_poll_profiles[idx].estimated_polls = (old_est * 7 + measured_polls * 3) / 10;
+        return;
+    }
+
+    ch554t_poll_profiles[ch554t_poll_profile_next_slot].jedec_id = jedec_id;
+    ch554t_poll_profiles[ch554t_poll_profile_next_slot].estimated_polls = measured_polls;
+    ch554t_poll_profile_next_slot++;
+    if (ch554t_poll_profile_next_slot >= CH554T_POLL_PROFILE_MAX) ch554t_poll_profile_next_slot = 0;
+}
+
+static void ch554t_erase_state_reset(void)
+{
+    ch554t_erase_active = 0;
+}
+
+int ch554t_erase_get_poll_stats(int *active, int *used, int *estimated, int *last_pass)
+{
+    if (active) *active = ch554t_erase_active;
+    if (used) *used = ch554t_erase_poll_count;
+    if (estimated) *estimated = ch554t_erase_estimated_polls;
+    if (last_pass) *last_pass = ch554t_erase_last_pass_polls;
+    return 0;
+}
+
+static double ch554t_initial_polls_per_byte(uint32_t jedec_id)
+{
+    uint8_t manufacturer = (uint8_t)((jedec_id >> 16) & 0xFFu);
+
+    /*
+     * Minimal JEDEC-based first guess:
+     * - ISSI parts observed much faster erase completion.
+     * - Everything else keeps the existing 512 polls / 8MiB baseline.
+     */
+    if (manufacturer == 0x9Du) return 1.0 / 65536.0; /* 128 polls / 8MiB */
+    return CH554T_ERASE_INIT_POLLS_PER_BYTE;          /* 512 polls / 8MiB */
+}
+
+static int ch554t_erase_estimate_total_polls(unsigned int chip_size_bytes, uint32_t jedec_id)
+{
+    int estimate;
+    int learned_estimate = ch554t_poll_profile_get(jedec_id);
+
+    if (learned_estimate > 0) {
+        estimate = learned_estimate;
+        if (estimate < CH554T_ERASE_MIN_LEARNED_POLLS) estimate = CH554T_ERASE_MIN_LEARNED_POLLS;
+    } else if (chip_size_bytes > 0) {
+        estimate = (int)((double)chip_size_bytes * ch554t_initial_polls_per_byte(jedec_id));
+        if (estimate < CH554T_ERASE_MIN_FALLBACK_POLLS) estimate = CH554T_ERASE_MIN_FALLBACK_POLLS;
+    } else {
+        estimate = 512;
+        if (estimate < CH554T_ERASE_MIN_FALLBACK_POLLS) estimate = CH554T_ERASE_MIN_FALLBACK_POLLS;
+    }
+
+    if (estimate > CH554T_ERASE_MAX_POLLS) estimate = CH554T_ERASE_MAX_POLLS;
+    return estimate;
+}
+
+static void ch554t_erase_learn(uint32_t jedec_id, int measured_polls)
+{
+    ch554t_poll_profile_set(jedec_id, measured_polls);
+}
+
+static int ch554t_erase_progressive(unsigned int sector_number, unsigned int total_sectors, unsigned int chip_size_bytes, uint32_t jedec_id)
+{
+    int poll_ret = 1;
+    int i;
+    int polls_this_call;
+    int polls_done_this_call = 0;
+    int remaining_estimate;
+    unsigned int remaining_sectors;
+
+    if (total_sectors == 0) total_sectors = 1;
+
+    if ((sector_number == 0) && ch554t_erase_active) {
+        (void)ch554t_chip_erase_finalize();
+        ch554t_erase_state_reset();
+    }
+
+    if (!ch554t_erase_active) {
+        if (sector_number != 0) return 0;
+        if (ch554t_chip_erase_start() != 0) return -1;
+        ch554t_erase_poll_count = 0;
+        ch554t_erase_last_pass_polls = 0;
+        ch554t_erase_estimated_polls = ch554t_erase_estimate_total_polls(chip_size_bytes, jedec_id);
+        ch554t_erase_active = 1;
+    }
+    ch554t_erase_last_pass_polls = 0;
+
+    if (sector_number < total_sectors) remaining_sectors = total_sectors - sector_number;
+    else remaining_sectors = 1;
+
+    remaining_estimate = ch554t_erase_estimated_polls - ch554t_erase_poll_count;
+    if (remaining_estimate < 1) remaining_estimate = 1;
+
+    polls_this_call = remaining_estimate / (int)remaining_sectors;
+    if (polls_this_call < 1) polls_this_call = 1;
+    if (polls_this_call > 8) polls_this_call = 8;
+
+    for (i = 0; i < polls_this_call; i++) {
+        poll_ret = ch554t_chip_erase_poll();
+        if (poll_ret < 0) {
+            (void)ch554t_chip_erase_finalize();
+            ch554t_erase_state_reset();
+            return -1;
+        }
+        ch554t_erase_poll_count++;
+        polls_done_this_call++;
+        if (poll_ret == 0) break;
+    }
+
+    /* Ensure erase is fully complete before we leave the last UI block. */
+    if ((poll_ret > 0) && (sector_number + 1 >= total_sectors)) {
+        while (ch554t_erase_poll_count < CH554T_ERASE_MAX_POLLS) {
+            poll_ret = ch554t_chip_erase_poll();
+            if (poll_ret < 0) {
+                (void)ch554t_chip_erase_finalize();
+                ch554t_erase_state_reset();
+                return -1;
+            }
+            ch554t_erase_poll_count++;
+            polls_done_this_call++;
+            if (poll_ret == 0) break;
+        }
+    }
+
+    ch554t_erase_last_pass_polls = polls_done_this_call;
+
+    if (poll_ret == 0) {
+        ch554t_erase_learn(jedec_id, ch554t_erase_poll_count);
+        (void)ch554t_chip_erase_finalize();
+        ch554t_erase_state_reset();
+        return 0;
+    }
+
+    if (ch554t_erase_poll_count >= CH554T_ERASE_MAX_POLLS) {
+        (void)ch554t_chip_erase_finalize();
+        ch554t_erase_state_reset();
+        return -1;
+    }
+
+    return 0;
+}
 
 /*
  * Set write enable latch with Write Enable command.
@@ -292,6 +522,15 @@ int snor_block_erase(unsigned int sector_number, unsigned int blockSize, u8 addr
     addr4b = addr4b & 0x0f;
 
     programmerType = progType;
+    if (snor_is_ch554t(progType)) {
+        unsigned int total_sectors = 1;
+        unsigned int chip_size_bytes = ch554t_chip_size_bytes(blockSize);
+        if ((blockSize > 0) && (chip_size_bytes > 0)) {
+            total_sectors = chip_size_bytes / blockSize;
+            if (total_sectors == 0) total_sectors = 1;
+        }
+        return ch554t_erase_progressive(sector_number, total_sectors, chip_size_bytes, ch554t_cached_jedec_id);
+    }
 
     if (addr4b) snor_4byte_mode(1);
 
@@ -322,6 +561,9 @@ int snor_read_devid(u8 *rxbuf, int n_rx, uint8_t progType)
 {
 	int retval = 0;
     programmerType = progType;
+    if (snor_is_ch554t(progType)) {
+        return ch554t_read_devid(rxbuf, n_rx);
+    }
 
     SPI_CONTROLLER_Chip_Select_Low(programmerType);
     SPI_CONTROLLER_Write_One_Byte(OPCODE_RDID, programmerType);
@@ -388,6 +630,10 @@ int snor_read_param(unsigned char *buf, unsigned long from, unsigned long len, u
 {
     u32 read_addr, physical_read_addr, remain_len, data_offset;
     programmerType = progType;
+    if (snor_is_ch554t(progType)) {
+        if (ch554t_read_data((uint32_t)from, buf, (uint32_t)len) != 0) return -1;
+        return (int)len;
+    }
     //addr4bit transforming
     algType = (addr4b & 0xf0) >> 4;
     addr4b = addr4b & 0x0f;
@@ -464,6 +710,10 @@ int snor_write_param(unsigned char *buf, unsigned long to, unsigned long len, un
     int rc = 0, retlen = 0;
 
     programmerType = progType;
+    if (snor_is_ch554t(progType)) {
+        if (ch554t_write_data((uint32_t)to, buf, (uint32_t)len) != 0) return -1;
+        return (int)len;
+    }
 
     //addr4bit transforming
     algType = (addr4b & 0xf0) >> 4;
@@ -544,14 +794,15 @@ int snor_write_param(unsigned char *buf, unsigned long to, unsigned long len, un
 
 int snorUnprotect(u8 progType)
 {
-    int ret;
     uint8_t buf[2];
+    programmerType = progType;
+    if (snor_is_ch554t(progType)) return 0;
 
 
 
     SPI_CONTROLLER_Chip_Select_Low(programmerType);
     SPI_CONTROLLER_Write_One_Byte(0x05, programmerType);
-    ret = SPI_CONTROLLER_Read_NByte(&buf[0],2,SPI_CONTROLLER_SPEED_SINGLE, programmerType);
+    (void)SPI_CONTROLLER_Read_NByte(&buf[0],2,SPI_CONTROLLER_SPEED_SINGLE, programmerType);
     SPI_CONTROLLER_Chip_Select_High(programmerType);
     usleep(1);
 
@@ -568,6 +819,7 @@ int snorUnprotect(u8 progType)
     SPI_CONTROLLER_Chip_Select_High(programmerType);
     usleep(1);
 
+    return 0;
 }
 
 int s95_read_param(unsigned char *buf, unsigned long from, unsigned long len, unsigned int sector_size, unsigned char currentAlgorithm, u8 progType)

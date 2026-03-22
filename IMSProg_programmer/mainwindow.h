@@ -130,6 +130,7 @@ private slots:
     void on_actionCH347T_triggered();
     void SetItemStatus(QString comboboxName, int itemNumber, bool setDisable);
     void on_actionCH347T_v1_1_triggered();
+    void on_actionCH554T_triggered();
     void on_actionShow_programmer_version_triggered();
     void on_actionCheck_erase_triggered();
     void on_actionFill_with_code_triggered();
@@ -175,6 +176,7 @@ private:
     uint32_t blockStartAddr, blockLen;
     uint8_t nandSettings;
     uint8_t current_programmer;
+    void applyProgrammerProfile(uint8_t programmer);
 };
 
 #endif // MAINWINDOW_H

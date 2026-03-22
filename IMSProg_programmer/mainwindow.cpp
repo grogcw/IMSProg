@@ -48,6 +48,13 @@ MainWindow::MainWindow(QWidget *parent) :
 {
  ui->setupUi(this);
 
+#ifdef Q_OS_MAC
+ // macOS: keep standard Quit behavior and avoid Cmd+Q conflict.
+ ui->actionExit->setMenuRole(QAction::QuitRole);
+ ui->actionExit->setShortcut(QKeySequence::Quit);
+ ui->actionEdit_chips_Database->setShortcut(QKeySequence::New);
+#endif
+
  max_rec = 0;
  isHalted = false;
  lastDirectory = QDir::homePath(); //"/home/";
@@ -154,6 +161,10 @@ MainWindow::MainWindow(QWidget *parent) :
               ui->actionCH347T_v1_1->setChecked(true);
               SetItemStatus("comboBox_type", 2, true);
           }
+       if (current_programmer == 4)
+          {
+              ui->actionCH554T->setChecked(true);
+          }
      settings.endGroup();
      settings.beginGroup("FormPosition");
      if (settings.contains("geometry"))
@@ -164,7 +175,9 @@ MainWindow::MainWindow(QWidget *parent) :
  }
  // connect and status check
  if (current_programmer < 2) ui->lStatus->setText("CH341A");
- if (current_programmer >= 2) ui->lStatus->setText("CH347T");
+ else if (current_programmer < 4) ui->lStatus->setText("CH347T");
+ else ui->lStatus->setText("CH554T");
+ applyProgrammerProfile(current_programmer);
  statusCH341 =  ProgDeviceInit(current_programmer, currentChipType, currentI2CBusSpeed);
  ch341StatusFlashing();
  ProgDeviceClose(current_programmer);
@@ -1850,6 +1863,9 @@ void MainWindow::doNotDisturb()
    ui->actionStop->setDisabled(false);
    ui->actionCH341A_B_v1_2->setDisabled(true);
    ui->actionCH341A_v1_7->setDisabled(true);
+   ui->actionCH347T->setDisabled(true);
+   ui->actionCH347T_v1_1->setDisabled(true);
+   ui->actionCH554T->setDisabled(true);
 
    ui->pushButton->blockSignals(true);
    ui->pushButton_2->blockSignals(true);
@@ -1896,6 +1912,9 @@ void MainWindow::doNotDisturbCancel()
       ui->actionFill_with_code->setDisabled(false);
       ui->actionCH341A_B_v1_2->setDisabled(false);
       ui->actionCH341A_v1_7->setDisabled(false);
+      ui->actionCH347T->setDisabled(false);
+      ui->actionCH347T_v1_1->setDisabled(false);
+      ui->actionCH554T->setDisabled(false);
       if ((currentChipType == 0) || (currentChipType == 6) || (currentChipType > 2)) ui->actionChip_info->setDisabled(false);
       if ((currentChipType == 0) || (currentChipType == 6)) ui->actionSecurity_registers->setDisabled(false);
       if (currentChipType == 6) ui->actionBad_block_management->setDisabled(false);
@@ -2519,28 +2538,35 @@ void MainWindow::on_actionCH341A_B_v1_2_triggered()
 {
     current_programmer = 0;
     ui->lStatus->setText("CH341A");
-    SetItemStatus("comboBox_type", 2, false);
+    applyProgrammerProfile(current_programmer);
 }
 
 void MainWindow::on_actionCH341A_v1_7_triggered()
 {
     current_programmer = 1;
     ui->lStatus->setText("CH341A");
-    SetItemStatus("comboBox_type", 2, false);
+    applyProgrammerProfile(current_programmer);
 }
 
 void MainWindow::on_actionCH347T_triggered()
 {
     current_programmer = 2;
     ui->lStatus->setText("CH347T");
-    SetItemStatus("comboBox_type", 2, true);
+    applyProgrammerProfile(current_programmer);
 }
 
 void MainWindow::on_actionCH347T_v1_1_triggered()
 {
     current_programmer = 3;
     ui->lStatus->setText("CH347T");
-    SetItemStatus("comboBox_type", 2, true);
+    applyProgrammerProfile(current_programmer);
+}
+
+void MainWindow::on_actionCH554T_triggered()
+{
+    current_programmer = 4;
+    ui->lStatus->setText("CH554T");
+    applyProgrammerProfile(current_programmer);
 }
 
 void MainWindow::closeEvent(QCloseEvent( *event))
@@ -2602,6 +2628,28 @@ void MainWindow::SetItemStatus(QString comboboxName, int itemNumber, bool setDis
             item->setFlags(item->flags() | Qt::ItemIsEnabled);
             item->setForeground(QBrush(comboBox->palette().color(QPalette::Text)));
         }
+    }
+}
+
+void MainWindow::applyProgrammerProfile(uint8_t programmer)
+{
+    // Start by enabling all known chip families in the type combo.
+    for (int i = 0; i <= 6; ++i) {
+        SetItemStatus("comboBox_type", i, false);
+    }
+
+    if (programmer == 2 || programmer == 3) {
+        // CH347 path has no Microwire support in IMSProg.
+        SetItemStatus("comboBox_type", 2, true);
+        return;
+    }
+
+    if (programmer == 4) {
+        // CH554T backend currently supports only SPI NOR flow.
+        for (int i = 1; i <= 6; ++i) {
+            SetItemStatus("comboBox_type", i, true);
+        }
+        ui->comboBox_type->setCurrentIndex(0);
     }
 }
 

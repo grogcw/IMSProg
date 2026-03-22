@@ -25,6 +25,7 @@ int snorUnprotect(u8 progType);
 int snor_erase(unsigned long offs, unsigned long len);
 int full_erase_chip(void);
 int snor_block_erase(unsigned int sector_number, unsigned int blockSize, u8 addr4b, u8 progType);
+int ch554t_erase_get_poll_stats(int *active, int *used, int *estimated, int *last_pass);
 int snor_write(unsigned char *buf, unsigned long to, unsigned long len);
 long snor_init(void);
 void support_snor_list(void);

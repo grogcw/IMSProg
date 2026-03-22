@@ -54,6 +54,7 @@ SOURCES += \
     dialognandsecurity.cpp \
     dialogbbm.cpp \
     ch347.c \
+    ch554t.c \
     ch34x_i2c.c \
     dialogfill.cpp
 
@@ -90,6 +91,7 @@ HEADERS += \
     dialognandsecurity.h \
     dialogbbm.h \
     ch347.h \
+    ch554t.h \
     ch34x_i2c.h \
     dialogfill.h
 
